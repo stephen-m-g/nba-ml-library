@@ -1,0 +1,23 @@
+# Core data handling
+pandas>=2.2
+numpy>=1.26
+
+# Data sources
+nba_api>=1.4.1
+kagglehub>=0.3
+
+# Modeling (used starting in the training phase)
+scikit-learn>=1.5
+
+# Visualization / EDA
+matplotlib>=3.9
+seaborn>=0.13
+
+# Notebooks
+jupyter>=1.0
+ipykernel>=6.29
+
+# Utilities
+requests>=2.32
+tqdm>=4.66
+python-dateutil>=2.9
