@@ -22,9 +22,7 @@ kaggle.json
 .env
 backend/.env
 
-frontend/node_modules/
-frontend/.next/
-frontend/next-env.d.ts
+# frontend/ has its own .gitignore (node_modules, .next/, .env*, etc.)
 
 EDA.txt
 personal-learning/

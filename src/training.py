@@ -55,16 +55,25 @@ def exclude_gap_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df[~df["possible_unlogged_gap"]]
 
 
-def prepare_xy(df: pd.DataFrame, label: str) -> tuple[pd.DataFrame, pd.Series]:
-    """X, y ready for sklearn: bool feature columns cast to float (the
-    classifier handles this fine either way, but keeping dtypes uniform and
-    explicit avoids surprises), NaNs left as-is — HistGradientBoostingClassifier
-    handles missing values natively, no imputation needed.
+def prepare_X(df: pd.DataFrame) -> pd.DataFrame:
+    """Feature matrix ready for sklearn: bool feature columns cast to float
+    (the classifier handles this fine either way, but keeping dtypes
+    uniform and explicit avoids surprises), NaNs left as-is —
+    HistGradientBoostingClassifier handles missing values natively, no
+    imputation needed. Shared by prepare_xy/prepare_xy_regression (batch,
+    labeled) and src/predict.py (live, unlabeled single-row inference) so
+    both stay in sync automatically rather than duplicating this logic.
     """
     X = df[FEATURE_COLUMNS].copy()
     for col in X.columns:
         if X[col].dtype == bool:
             X[col] = X[col].astype(float)
+    return X
+
+
+def prepare_xy(df: pd.DataFrame, label: str) -> tuple[pd.DataFrame, pd.Series]:
+    """X, y ready for sklearn — see prepare_X for the X side."""
+    X = prepare_X(df)
     y = df[label].astype(int)
     return X, y
 
@@ -76,10 +85,7 @@ def prepare_xy_regression(df: pd.DataFrame, label: str) -> tuple[pd.DataFrame, p
     an error, just quietly corrupt the target. Kept as a separate function
     rather than a flag on prepare_xy so that mistake isn't possible to make.
     """
-    X = df[FEATURE_COLUMNS].copy()
-    for col in X.columns:
-        if X[col].dtype == bool:
-            X[col] = X[col].astype(float)
+    X = prepare_X(df)
     y = df[label].astype(float)
     return X, y
 

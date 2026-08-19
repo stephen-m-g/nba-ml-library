@@ -235,7 +235,16 @@ def compute_workload_features(
         counts = s.rolling(f"{density_window_days}D", closed="left").count()
         return pd.Series(counts.values, index=g.index)
 
-    df[density_col] = df.groupby("PLAYER_ID", group_keys=False)[["GAME_DATE", "GAME_ID"]].apply(count_recent)
+    # Explicit per-group loop + concat instead of groupby(...).apply(count_recent):
+    # confirmed (this session, reproduced in isolation) that .apply() collapses
+    # the per-group Series results into a single-row DataFrame instead of a
+    # flat Series whenever there's exactly one group — silently wrong in a
+    # way that only surfaces with single-player input (e.g. live inference,
+    # src/live_features.py), never with the many-player batch data this
+    # function has always been called on before. This form gives the same
+    # result for many groups and is also correct for one.
+    density_parts = [count_recent(g) for _, g in df.groupby("PLAYER_ID", group_keys=False, sort=False)]
+    df[density_col] = pd.concat(density_parts).sort_index()
 
     return df[["PLAYER_ID", "GAME_ID", "GAME_DATE", "min_avg_acute", "min_avg_chronic",
                "acute_chronic_ratio", density_col]]
@@ -265,6 +274,61 @@ def compute_cohort(bio: pd.DataFrame) -> pd.DataFrame:
     })
 
 
+def compute_bmi_tercile_edges(bio: pd.DataFrame) -> np.ndarray:
+    """The BMI bin edges compute_cohort's internal pd.qcut(bmi, 3, ...)
+    determines from a given bio population — exposed separately (same BMI
+    formula, same input, so always identical to compute_cohort's own
+    internal edges) so a single NEW player (live inference) can be
+    classified into the same low/mid/high BMI tercile the cohort
+    baselines were fit against, without needing the whole bio population
+    at request time. See src/live_features.py::classify_live_cohort.
+    """
+    b = bio.rename(columns={"PERSON_ID": "PLAYER_ID"}).copy()
+    feet_inches = b["HEIGHT"].str.split("-", expand=True).astype(float)
+    height_inches = feet_inches[0] * 12 + feet_inches[1]
+    bmi = 703 * b["WEIGHT"] / (height_inches ** 2)
+    _, edges = pd.qcut(bmi, 3, retbins=True)
+    return edges
+
+
+def fit_cohort_baseline(
+    player_log: pd.DataFrame,
+    bio: pd.DataFrame,
+    train_season_ids: list[str],
+    chronic_window: int = 15,
+) -> tuple[pd.Series, float]:
+    """Fits the cohort -> typical-early-career-minutes lookup that
+    apply_cohort_backfill blends in for players without enough of their own
+    history yet. For each (position x BMI-tercile) cohort (see
+    compute_cohort), the mean MIN among TRAIN-season rows where the player
+    was still early in their own career (games_so_far < chronic_window).
+
+    Extracted out of apply_cohort_backfill as its own function so this can
+    be fit ONCE (offline, same leakage-avoidance principle as everywhere
+    else in this pipeline — never fit on val/test/live data) and reused —
+    both by apply_cohort_backfill itself and by the live single-player
+    pipeline (src/live_features.py), which must apply this same frozen
+    baseline rather than refitting it from whatever data a live request
+    happens to see.
+
+    Returns (cohort_baseline_map, overall_baseline) — overall_baseline is
+    the fallback for any cohort with no matching train-season rows.
+    """
+    cohort = compute_cohort(bio)
+
+    pl = player_log[["PLAYER_ID", "GAME_ID", "GAME_DATE", "SEASON_ID", "MIN"]].copy()
+    pl["GAME_DATE"] = pd.to_datetime(pl["GAME_DATE"])
+    pl = pl.sort_values(["PLAYER_ID", "GAME_DATE"])
+    pl = pl.merge(cohort, on="PLAYER_ID", how="left")
+    pl["games_so_far"] = pl.groupby("PLAYER_ID")["MIN"].cumcount()
+
+    train_mask = pl["SEASON_ID"].astype(str).isin(train_season_ids)
+    early_career = pl.loc[train_mask & (pl["games_so_far"] < chronic_window)]
+    cohort_baseline_map = early_career.groupby("cohort")["MIN"].mean()
+    overall_baseline = early_career["MIN"].mean()
+    return cohort_baseline_map, overall_baseline
+
+
 def apply_cohort_backfill(
     workload: pd.DataFrame,
     player_log: pd.DataFrame,
@@ -284,10 +348,11 @@ def apply_cohort_backfill(
     Fix: a shrinkage-weighted blend of the player's own partial history (an
     expanding average of their actual games so far) and a "typical early-
     career minutes" baseline from similar players — same primary position,
-    similar BMI (see compute_cohort). At zero career games (a debut), the
-    blend is 100% cohort baseline; by the time the real window is full, it's
-    100% personal data (unchanged from compute_workload_features) — the
-    cohort estimate's influence fades out smoothly as real history accumulates.
+    similar BMI (see compute_cohort and fit_cohort_baseline). At zero
+    career games (a debut), the blend is 100% cohort baseline; by the time
+    the real window is full, it's 100% personal data (unchanged from
+    compute_workload_features) — the cohort estimate's influence fades out
+    smoothly as real history accumulates.
 
     Cohort baselines are computed using ONLY train_season_ids, the same
     leakage-avoidance principle used for calibration fitting elsewhere in
@@ -298,6 +363,9 @@ def apply_cohort_backfill(
     and all rows that already had real values, untouched).
     """
     cohort = compute_cohort(bio)
+    cohort_baseline_map, overall_baseline = fit_cohort_baseline(
+        player_log, bio, train_season_ids, chronic_window
+    )
 
     pl = player_log[["PLAYER_ID", "GAME_ID", "GAME_DATE", "SEASON_ID", "MIN"]].copy()
     pl["GAME_DATE"] = pd.to_datetime(pl["GAME_DATE"])
@@ -308,10 +376,6 @@ def apply_cohort_backfill(
     pl["games_so_far"] = grp.cumcount()  # 0 on a player's debut game, counts strictly-prior games
     pl["personal_expanding_avg"] = grp.transform(lambda s: s.shift(1).expanding().mean())
 
-    train_mask = pl["SEASON_ID"].astype(str).isin(train_season_ids)
-    early_career = pl.loc[train_mask & (pl["games_so_far"] < chronic_window)]
-    cohort_baseline_map = early_career.groupby("cohort")["MIN"].mean()
-    overall_baseline = early_career["MIN"].mean()
     pl["cohort_baseline"] = pl["cohort"].map(cohort_baseline_map).fillna(overall_baseline)
 
     def blended(window: int) -> pd.Series:
@@ -356,7 +420,12 @@ def compute_extended_absence_features(player_log: pd.DataFrame) -> pd.DataFrame:
     Returns PLAYER_ID, GAME_ID, GAME_DATE, games_since_extended_return,
     is_returning_from_extended_absence.
     """
-    season_idx_map = {f"2{y}": i for i, y in enumerate(range(2016, 2026))}
+    # Range intentionally extends well past the data this batch pipeline
+    # currently has (2016-17..2025-26) — this function is also called live
+    # (src/live_features.py) for "today", which keeps moving forward. The
+    # extra years are a strict superset: every SEASON_ID that actually
+    # exists in current data still maps to the exact same index as before.
+    season_idx_map = {f"2{y}": i for i, y in enumerate(range(2016, 2046))}
 
     df = player_log[["PLAYER_ID", "GAME_ID", "GAME_DATE", "SEASON_ID"]].copy()
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
@@ -484,9 +553,15 @@ def compute_travel_features(team_log: pd.DataFrame, density_window_days: int = 1
     # offseason gap always exceeds 14 days) — pandas' time-based rolling
     # returns NaN for a truly empty window's sum rather than 0, but "zero
     # games in the last 14 days" is exactly what's true here, so fill it in
-    df["travel_distance_last_14d"] = df.groupby("TEAM_ID", group_keys=False)[
-        ["GAME_DATE", "travel_distance_last_game"]
-    ].apply(rolling_sum_by_date).fillna(0)
+    #
+    # Explicit per-group loop + concat rather than groupby(...).apply(...):
+    # same fix as compute_workload_features's count_recent, and for the
+    # same reason — .apply() collapses a Series-returning function's
+    # per-group results into a single-row DataFrame when there's exactly
+    # one group, which only surfaces with single-team input (live
+    # inference), never with this repo's many-team batch data.
+    travel_parts = [rolling_sum_by_date(g) for _, g in df.groupby("TEAM_ID", group_keys=False, sort=False)]
+    df["travel_distance_last_14d"] = pd.concat(travel_parts).sort_index().fillna(0)
 
     def road_trip_and_days_since_home(g: pd.DataFrame) -> pd.DataFrame:
         is_home = g["is_home"].values

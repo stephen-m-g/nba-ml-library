@@ -1,0 +1,14 @@
+# Deploy-slim runtime deps for the FastAPI service only — deliberately NOT
+# the same as the root requirements.txt (no jupyter/matplotlib/seaborn, and
+# no kagglehub: the running service never touches the Kaggle dataset
+# directly, only the offline notebooks/20 snapshot builder does).
+
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic-settings>=2.6
+
+joblib>=1.4
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+nba_api>=1.4.1

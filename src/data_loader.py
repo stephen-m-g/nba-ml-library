@@ -204,6 +204,23 @@ def get_player_bio(player_id: int) -> pd.DataFrame:
                  "FROM_YEAR", "DRAFT_YEAR"]]
 
 
+def get_player_current_info(player_id: int) -> pd.DataFrame:
+    """Same CommonPlayerInfo call as get_player_bio(), widened to also
+    include the player's CURRENT team and roster status. Needed for live
+    single-player inference (current-team join for PACE/OFF/DEF and travel
+    features), not by the batch pipeline — kept as a separate function
+    rather than widening get_player_bio() itself, since notebooks 04/11
+    already depend on that function's narrower column selection. Empty
+    frame (0 rows) means an invalid player_id — callers decide how to
+    handle that, this just returns whatever the API gives back.
+    """
+    from nba_api.stats.endpoints import commonplayerinfo
+
+    info = commonplayerinfo.CommonPlayerInfo(player_id=player_id, timeout=30).get_data_frames()[0]
+    return info[["PERSON_ID", "DISPLAY_FIRST_LAST", "BIRTHDATE", "POSITION", "HEIGHT", "WEIGHT",
+                 "FROM_YEAR", "DRAFT_YEAR", "TEAM_ID", "TEAM_ABBREVIATION", "TEAM_NAME", "ROSTERSTATUS"]]
+
+
 def fetch_and_cache_player_bios(
     player_ids: list[int],
     out_dir: Path | str = RAW_DIR,
