@@ -30,6 +30,18 @@ class LiveReferenceData:
     """Frozen, train-fit-once inputs the live feature pipeline applies but
     never refits. `coverage_end` is surfaced directly in every API response
     as `injury_history_as_of` — the visible staleness caveat.
+
+    The supplement_* fields are populated by
+    notebooks/22_extend_injury_coverage.py (see src/injury_backfill.py),
+    which extends injury coverage past the Kaggle source's own end using
+    the NBA's official injury reports. When it runs, `coverage_end`
+    ADVANCES to the supplemented date while `base_coverage_end` retains
+    the original Kaggle cutoff — so "how current is this" and "how much of
+    it came from the primary source" stay separately answerable rather
+    than one silently overwriting the other. All default to None/empty so
+    a snapshot built by notebook 20 alone (no supplement yet) is still
+    valid, and so unpickling a snapshot written before these fields
+    existed doesn't explode (see load_snapshot).
     """
     intervals: dict[int, tuple[np.ndarray, np.ndarray]]
     coverage_end: pd.Timestamp
@@ -38,6 +50,40 @@ class LiveReferenceData:
     bmi_tercile_edges: np.ndarray
     train_season_ids: list[str]
     snapshot_built_at: pd.Timestamp
+    base_coverage_end: pd.Timestamp | None = None
+    supplement_start: pd.Timestamp | None = None
+    supplement_coverage: pd.DataFrame | None = None
+    supplement_diagnostics: dict | None = None
+    supplement_built_at: pd.Timestamp | None = None
+
+    @property
+    def coverage_gap(self) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+        """(start, end) of the span with NO injury coverage from either
+        source, or None if there isn't one. Real and permanent as of
+        writing: the Kaggle data stops at base_coverage_end, while the
+        NBA's report CDN only retains ~8 months, so the stretch between
+        them can't be recovered from either source. Surfaced through the
+        API rather than papered over by simply advancing coverage_end.
+        """
+        if self.base_coverage_end is None or self.supplement_start is None:
+            return None
+        gap_start = self.base_coverage_end + pd.Timedelta(days=1)
+        gap_end = self.supplement_start - pd.Timedelta(days=1)
+        return (gap_start, gap_end) if gap_start <= gap_end else None
+
+    def confidence_for(self, player_id: int) -> float | None:
+        """Fraction of this player's missed games in the supplemented
+        window that a report actually covered — None if no supplement has
+        been built, or this player had no missed games in it (nothing to
+        be uncertain about). See src/injury_backfill.py for exactly what
+        counts as "resolved."
+        """
+        if self.supplement_coverage is None or len(self.supplement_coverage) == 0:
+            return None
+        row = self.supplement_coverage[self.supplement_coverage["PLAYER_ID"] == player_id]
+        if len(row) == 0 or pd.isna(row.iloc[0]["confidence"]):
+            return None
+        return float(row.iloc[0]["confidence"])
 
 
 def build_live_reference_snapshot(
@@ -82,4 +128,16 @@ def load_snapshot(path: Path | str = DEFAULT_SNAPSHOT_PATH) -> LiveReferenceData
         raise FileNotFoundError(
             f"No live reference snapshot at {path}. Run notebooks/20_build_live_reference_data.py first."
         )
-    return joblib.load(path)
+    ref = joblib.load(path)
+    # Unpickling restores __dict__ directly without calling __init__, so a
+    # snapshot written before the supplement_* fields existed comes back
+    # missing them entirely rather than getting their defaults. Fill them
+    # in here so older snapshots keep working instead of failing with an
+    # AttributeError somewhere deep in the live pipeline.
+    for field, default in [
+        ("base_coverage_end", None), ("supplement_start", None), ("supplement_coverage", None),
+        ("supplement_diagnostics", None), ("supplement_built_at", None),
+    ]:
+        if not hasattr(ref, field):
+            setattr(ref, field, default)
+    return ref

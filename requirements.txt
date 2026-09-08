@@ -5,6 +5,7 @@ numpy>=1.26
 # Data sources
 nba_api>=1.4.1
 kagglehub>=0.3
+pdfplumber>=0.11  # NBA official injury report PDFs (src/injury_reports.py) — pure Python, no Java
 
 # Modeling (used starting in the training phase)
 scikit-learn>=1.5

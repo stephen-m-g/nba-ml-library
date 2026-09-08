@@ -45,6 +45,7 @@ def get_player_risk(player_id: int, state: AppState = Depends(get_state)) -> Ris
         })
 
     predictions = predict_elevated_risk(live_result.features, state.models)
+    gap = state.reference.coverage_gap
 
     return RiskResponse(
         # every successful prediction required resolving a current team
@@ -58,6 +59,12 @@ def get_player_risk(player_id: int, state: AppState = Depends(get_state)) -> Ris
             y_10game=PredictionForLabel(**predictions["y_10game"]),
         ),
         injury_history_as_of=state.reference.coverage_end.date().isoformat(),
+        injury_history_source_as_of=(
+            state.reference.base_coverage_end.date().isoformat()
+            if state.reference.base_coverage_end is not None else None
+        ),
+        injury_history_gap_start=gap[0].date().isoformat() if gap else None,
+        injury_history_gap_end=gap[1].date().isoformat() if gap else None,
         data_quality=DataQuality(**live_result.data_quality),
         caveats=[Caveat(**w) for w in live_result.warnings],
     )

@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.config import settings
 from backend.schemas import HealthResponse
 from backend.state import build_app_state
-from backend.routers import players, risk
+from backend.routers import players, risk, stats
 
 
 @asynccontextmanager
@@ -39,14 +39,27 @@ app.add_middleware(
 
 app.include_router(players.router)
 app.include_router(risk.router)
+app.include_router(stats.router)
 
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     state = app.state.app_state
+    ref = state.reference
+    diag = ref.supplement_diagnostics or {}
     return HealthResponse(
         status="ok",
         models_loaded=len(state.models),
-        reference_players=len(state.reference.intervals),
-        injury_history_as_of=state.reference.coverage_end.date().isoformat(),
+        reference_players=len(ref.intervals),
+        injury_history_as_of=ref.coverage_end.date().isoformat(),
+        injury_history_source_as_of=(
+            ref.base_coverage_end.date().isoformat() if ref.base_coverage_end is not None else None
+        ),
+        # Surfaced here so "when was the injury backfill last run, and how
+        # complete was it" is answerable without digging into the snapshot
+        # — this is the signal that notebooks/22 is overdue for a re-run.
+        injury_supplement_built_at=(
+            ref.supplement_built_at.isoformat() if ref.supplement_built_at is not None else None
+        ),
+        injury_supplement_confidence=diag.get("overall_confidence"),
     )

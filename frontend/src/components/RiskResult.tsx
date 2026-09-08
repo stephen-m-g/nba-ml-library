@@ -61,6 +61,11 @@ export default function RiskResult({ playerId }: RiskResultProps) {
   }
 
   const { data } = state;
+  const confidence = data.data_quality.injury_data_confidence;
+  const confidenceTone =
+    confidence === null ? "text-gray-500" : confidence >= 0.8 ? "text-green-700" : confidence >= 0.5 ? "text-yellow-700" : "text-red-700";
+  const confidenceBar =
+    confidence === null ? "bg-gray-400" : confidence >= 0.8 ? "bg-green-600" : confidence >= 0.5 ? "bg-yellow-500" : "bg-red-600";
 
   return (
     <div className="mt-6 space-y-4">
@@ -103,14 +108,47 @@ export default function RiskResult({ playerId }: RiskResultProps) {
         </ul>
       )}
 
+      {confidence !== null && (
+        <div className="rounded border border-gray-200 px-3 py-2">
+          <div className="flex items-center justify-between text-sm">
+            <span className="font-medium text-gray-700">Injury history confidence</span>
+            <span className={`font-semibold ${confidenceTone}`}>{(confidence * 100).toFixed(0)}%</span>
+          </div>
+          <div className="mt-1 h-2 w-full overflow-hidden rounded bg-gray-200">
+            <div
+              className={`h-full ${confidenceBar}`}
+              style={{ width: `${Math.round(confidence * 100)}%` }}
+            />
+          </div>
+          <p className="mt-1 text-xs text-gray-500">
+            Share of this player&apos;s missed games since{" "}
+            {data.injury_history_source_as_of ?? data.injury_history_as_of} that could be checked against an
+            official NBA injury report.
+          </p>
+        </div>
+      )}
+
       <details className="rounded border border-gray-200 px-3 py-2 text-sm text-gray-600">
         <summary className="cursor-pointer font-medium">Data quality</summary>
         <ul className="mt-2 space-y-1">
           <li>Injury history current as of: {data.injury_history_as_of}</li>
+          {data.injury_history_source_as_of && (
+            <li>Primary source (Kaggle) covers through: {data.injury_history_source_as_of}</li>
+          )}
+          {data.injury_history_gap_start && data.injury_history_gap_end && (
+            <li>
+              Known coverage gap: {data.injury_history_gap_start} to {data.injury_history_gap_end} (no
+              injury data available from either source)
+            </li>
+          )}
           <li>Last game played: {data.data_quality.last_game_played ?? "no record"}</li>
           <li>Days since last game: {data.data_quality.days_since_last_game ?? "unknown"}</li>
           <li>Games used for workload average: {data.data_quality.games_used_for_workload}</li>
           <li>Cohort backfill used: {data.data_quality.cohort_backfill_used ? "yes" : "no"}</li>
+          <li>
+            Injury history confidence:{" "}
+            {confidence === null ? "not measured" : `${(confidence * 100).toFixed(0)}%`}
+          </li>
         </ul>
       </details>
     </div>

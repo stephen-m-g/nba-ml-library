@@ -19,7 +19,9 @@ A separate "fatigue" model line (`src/fatigue_labels.py`, `models/fatigue/`) was
 cd notebooks && ../.venv/Scripts/python.exe 07_train_all_models.py
 ```
 
-There is no test suite, linter, or build step in this repo.
+There is no unit-test suite or linter. The closest thing to a regression test is `notebooks/21_validate_live_features.py`, which diffs the live feature pipeline against known-good rows in `features.csv` — run it after changing `src/live_features.py` or any `feature_engineering.py` function it uses. The frontend does have a typecheck: `cd frontend && npx tsc --noEmit`.
+
+`src` is an installed package (`pip install -e .`, see `pyproject.toml`), so `from src... import` works from any cwd — the backend depends on this. The notebooks' own `sys.path.insert` lines are still there and still work.
 
 **Windows console gotcha**: player/team names contain non-ASCII characters (e.g. "Jokić"). Set `PYTHONIOENCODING=utf-8` when running scripts from a shell, or `print()` calls on unfiltered name columns will crash with `UnicodeEncodeError` on the default cp1252 console.
 
@@ -36,6 +38,7 @@ Notebooks are numbered and meant to be read/run as an ordered build pipeline, ea
 5. `08`, `10`: evaluation (permutation importance, calibration curves, segment analysis, held-out test set).
 6. `15`–`18`: the abandoned fatigue-model line (classification, then regression).
 7. `19`: builds the "elevated risk" binary threshold on top of the v3 injury models — the actual current deliverable.
+8. `20`–`22`: **live-serving support, not model building.** `20` snapshots the train-fit-once reference data the live app needs (injury intervals + cohort baselines) to `data/processed/live_reference_snapshot.joblib`; `21` validates the live single-player feature pipeline against known-good rows in `features.csv` (**the regression check to re-run after touching `live_features.py` or anything it depends on**); `22` extends injury coverage past the Kaggle source's cutoff using the NBA's official injury reports, and computes the per-player confidence score. `20` and `22` write the snapshot the backend loads at startup; re-run `22` periodically to keep coverage current.
 
 ### `src/` module responsibilities
 
@@ -44,6 +47,26 @@ Notebooks are numbered and meant to be read/run as an ordered build pipeline, ea
 - **`fatigue_labels.py`** — the abandoned model line's label construction (`build_fatigue_labels` for classification, `build_fatigue_regression_targets` for regression). Reuses `feature_engineering`'s feature functions unchanged.
 - **`training.py`** — model-agnostic training utilities: `FEATURE_COLUMNS` (the single source of truth for what columns a model consumes — must match what's actually in the features CSV) and `LABEL_COLUMNS`, `time_based_split`, `prepare_xy`/`prepare_xy_regression`, `tune_hyperparameters`, `train_classifier`/`train_regressor`.
 - **`evaluation.py`** — permutation importance, calibration-curve binning, segment-based error analysis. Takes a fitted model + held-out X/y; never trains anything.
+
+Live-serving modules (added for the web app; the batch pipeline above does not depend on any of them):
+
+- **`live_features.py`** — the live analog of the batch feature pipeline, for ONE player "as of today" (`assemble_live_features` is the single entry point). Reuses `feature_engineering`'s functions unchanged where "as of today" means the same thing as "as of the next game," and adapts them where it genuinely doesn't — every such function documents why. Several adaptations are subtle and were only caught by notebook 21; read those docstrings before changing anything here.
+- **`live_reference_data.py`** — the `LiveReferenceData` snapshot (injury intervals, cohort baselines, BMI tercile edges, coverage dates, per-player confidence) plus its build/save/load. Frozen, train-fit-once data the live path applies but never refits.
+- **`predict.py`** — loads the three v3 models and applies `ELEVATED_RISK_THRESHOLDS` (the single importable home for those fixed cutoffs).
+- **`player_stats.py`** — season/career per-game averages for display. A thin NBA API passthrough, no modeling.
+- **`injury_reports.py`** — fetches and parses the NBA's official injury-report PDFs (`pdfplumber`, pure Python, no Java). Parsing is position-based; the docstrings record the layout quirks that broke naive approaches.
+- **`injury_backfill.py`** — league-wide offline reconstruction of injury intervals from those reports, plus the per-player confidence measure. Driven by notebook 22.
+
+### Web app (`backend/`, `frontend/`)
+
+Next.js frontend + FastAPI backend; the model and all pandas logic stay in Python. The browser only ever talks to the Next.js origin, which proxies to FastAPI via server-only route handlers (`PY_API_BASE_URL`). Endpoints: `GET /players` (search, served from a cached static table), `GET /players/{id}/risk`, `GET /players/{id}/stats`, `GET /health`.
+
+Backend startup loads the models, the reference snapshot, and the static player table once (`backend/state.py`); it **fails loudly if the snapshot is missing** — run notebook 20 first. Config is env-driven (`backend/config.py`, `backend/.env.example`).
+
+```bash
+# Both servers at once (from frontend/) — needs `pip install -e .` done once
+npm run dev:all
+```
 
 ### Cross-cutting patterns worth knowing before touching this code
 

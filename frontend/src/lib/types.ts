@@ -35,6 +35,9 @@ export interface DataQuality {
   games_used_for_workload: number;
   cohort_backfill_used: boolean;
   extended_absence_return: boolean;
+  recent_injury_checks: number;
+  recent_injury_confirmed: number;
+  injury_data_confidence: number | null;
 }
 
 export interface Caveat {
@@ -48,6 +51,9 @@ export interface RiskResponse {
   as_of: string;
   predictions: Predictions;
   injury_history_as_of: string;
+  injury_history_source_as_of: string | null;
+  injury_history_gap_start: string | null;
+  injury_history_gap_end: string | null;
   data_quality: DataQuality;
   caveats: Caveat[];
 }
@@ -56,4 +62,32 @@ export interface ApiErrorDetail {
   error_code: string;
   message: string;
   player_id?: number;
+}
+
+export interface SeasonStats {
+  season: string;
+  games_played: number;
+  pts: number;
+  reb: number;
+  ast: number;
+  stl: number;
+  blk: number;
+  tov: number;
+}
+
+export interface CareerStats {
+  seasons_played: number;
+  games_played: number;
+  pts: number;
+  reb: number;
+  ast: number;
+  stl: number;
+  blk: number;
+  tov: number;
+}
+
+export interface PlayerStatsResponse {
+  player: PlayerSummary;
+  season: SeasonStats | null;
+  career: CareerStats;
 }

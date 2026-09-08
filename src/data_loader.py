@@ -4,10 +4,43 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Callable, TypeVar
 
 import pandas as pd
 
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
+
+
+class PlayerNotFoundError(Exception):
+    """No player exists for the given player_id."""
+
+
+class NbaApiUnavailableError(Exception):
+    """A live NBA Stats API call failed or timed out."""
+
+
+T = TypeVar("T")
+
+
+def retry_api_call(fn: Callable[[], T], attempts: int = 2, backoff_sec: float = 1.5) -> T:
+    """Call fn() up to `attempts` times, sleeping backoff_sec between
+    attempts, re-raising the last exception if every attempt fails. Shared
+    by every live (non-cached) NBA Stats API call site — src/live_features.py
+    and src/player_stats.py — since stats.nba.com is unofficial and
+    unauthenticated: connection resets and timeouts under moderate load are
+    routine, not exceptional, confirmed repeatedly while building this
+    project. One retry before treating a call as genuinely unavailable;
+    more than that just makes an active rate-limit worse, not better.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt < attempts - 1:
+                time.sleep(backoff_sec)
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------

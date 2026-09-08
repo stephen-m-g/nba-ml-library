@@ -12,14 +12,16 @@ Entry point: assemble_live_features(player_id, ref, as_of=None).
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
-from typing import Callable, TypeVar
+from typing import Callable
 
 import numpy as np
 import pandas as pd
 
-from src.data_loader import season_string, get_player_current_info, get_team_advanced_stats
+from src.data_loader import (
+    season_string, get_player_current_info, get_team_advanced_stats, retry_api_call,
+    PlayerNotFoundError, NbaApiUnavailableError,
+)
 from src.feature_engineering import (
     LONG_LAYOFF_DAYS,
     compute_workload_features,
@@ -28,46 +30,30 @@ from src.feature_engineering import (
     compute_bio_features,
     compute_travel_features,
 )
+from src.injury_backfill import build_intervals_from_missed_dates
+from src.injury_reports import find_player_status_for_date, categorize_report_reason
 from src.live_reference_data import LiveReferenceData
 from src.training import FEATURE_COLUMNS
 
 
-class PlayerNotFoundError(Exception):
-    """No player exists for the given player_id."""
+# Below this, the API adds an explicit LOW_INJURY_DATA_CONFIDENCE caveat.
+# 0.8 rather than something stricter because the confidence denominator
+# includes every missed game (deep-bench DNPs included), so a genuine
+# rotation player with real coverage sits well above this in practice.
+LOW_CONFIDENCE_THRESHOLD = 0.8
 
 
 class NoCurrentTeamError(Exception):
     """Player has no current NBA team (free agent, retired, inactive) —
     blocks the team-based features (PACE/OFF/DEF + all travel features) in
     a way training never saw for an isolated row, so this is refused
-    rather than predicted through. See project plan's error table."""
+    rather than predicted through. See project plan's error table.
 
-
-class NbaApiUnavailableError(Exception):
-    """A live NBA Stats API call failed or timed out."""
-
-
-T = TypeVar("T")
-
-
-def _retry(fn: Callable[[], T], attempts: int = 2, backoff_sec: float = 1.5) -> T:
-    """Call fn() up to `attempts` times, sleeping backoff_sec between
-    attempts, re-raising the last exception if every attempt fails. This is
-    an unofficial, unauthenticated API (stats.nba.com) — connection resets
-    and timeouts under load are routine, not exceptional, so one retry
-    before treating a call as genuinely unavailable matches the project
-    plan's error-handling design (503 NBA_API_UNAVAILABLE only after a
-    retry, not on the first hiccup).
-    """
-    last_exc: Exception | None = None
-    for attempt in range(attempts):
-        try:
-            return fn()
-        except Exception as e:
-            last_exc = e
-            if attempt < attempts - 1:
-                time.sleep(backoff_sec)
-    raise last_exc
+    (PlayerNotFoundError and NbaApiUnavailableError used to live here too —
+    moved to src/data_loader.py since src/player_stats.py needs them too
+    and they're not specific to the injury-risk pipeline. Still importable
+    from this module as before; nothing that already imports them from
+    here needs to change.)"""
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +99,7 @@ def fetch_live_player_bio(player_id: int) -> dict:
     """Bio + CURRENT team in one call (see data_loader.get_player_current_info).
     Raises PlayerNotFoundError for an invalid player_id (empty response)."""
     try:
-        info = _retry(lambda: get_player_current_info(player_id))
+        info = retry_api_call(lambda: get_player_current_info(player_id))
     except Exception as e:
         raise NbaApiUnavailableError(f"commonplayerinfo failed for player_id={player_id}: {e}") from e
 
@@ -166,7 +152,7 @@ def fetch_live_player_game_log(player_id: int, as_of: pd.Timestamp, min_games: i
     frames, total = [], 0
     for season in resolve_reference_seasons(as_of, max_lookback):
         try:
-            df = _retry(lambda s=season: playergamelog.PlayerGameLog(
+            df = retry_api_call(lambda s=season: playergamelog.PlayerGameLog(
                 player_id=player_id, season=s, timeout=15
             ).get_data_frames()[0])
         except Exception as e:
@@ -208,7 +194,7 @@ def fetch_live_team_game_log(team_id: int, team_abbreviation: str, as_of: pd.Tim
     frames, total = [], 0
     for season in resolve_reference_seasons(as_of, max_lookback):
         try:
-            df = _retry(lambda s=season: teamgamelog.TeamGameLog(
+            df = retry_api_call(lambda s=season: teamgamelog.TeamGameLog(
                 team_id=team_id, season=s, timeout=15
             ).get_data_frames()[0])
         except Exception as e:
@@ -242,7 +228,7 @@ def fetch_live_team_advanced_stats(team_id: int, as_of: pd.Timestamp, max_lookba
     this team_id at all (shouldn't happen for a real active team)."""
     for season in resolve_reference_seasons(as_of, max_lookback):
         try:
-            stats = _retry(lambda s=season: get_team_advanced_stats(s))
+            stats = retry_api_call(lambda s=season: get_team_advanced_stats(s))
         except Exception as e:
             raise NbaApiUnavailableError(f"leaguedashteamstats failed for season={season}: {e}") from e
         row = stats[stats["TEAM_ID"] == team_id]
@@ -451,19 +437,120 @@ def compute_live_extended_absence_features(player_game_log: pd.DataFrame, as_of:
     }
 
 
-def compute_live_injury_history_features(player_id: int, as_of: pd.Timestamp, ref: LiveReferenceData,
-                                          lookback_days: int = 365) -> dict:
-    """compute_injury_history_features already accepts arbitrary game_rows
-    with a GAME_DATE column — it's already "as of an arbitrary date" by
-    design (no adaptation needed beyond building one synthetic row)."""
+def _find_recent_missed_dates(player_game_log: pd.DataFrame, team_game_log: pd.DataFrame,
+                               since: pd.Timestamp, as_of: pd.Timestamp) -> list[pd.Timestamp]:
+    """Dates the player's team played but the player didn't, strictly
+    after `since` (the frozen snapshot's coverage_end) and before as_of —
+    the candidate pool for live injury-report gap-filling, most-recent-first.
+    Bounded only by whatever player_game_log/team_game_log already cover
+    (their own min_games/season-fallback windows — not widened just for
+    this), so this only ever fills the RECENT portion of a long gap, never
+    claims to cover the whole thing. That's a deliberate scope match to
+    "used when fetching a player's profile" (live, per-lookup), not a
+    historical-archive rebuild — see src/injury_reports.py's module docstring.
+    """
+    if len(team_game_log) == 0:
+        return []
+    played_dates = set(player_game_log["GAME_DATE"]) if len(player_game_log) else set()
+    missed = sorted(
+        (d for d in team_game_log["GAME_DATE"] if since < d < as_of and d not in played_dates),
+        reverse=True,
+    )
+    return missed
+
+
+def _build_gap_fill_intervals(
+    missed_dates: list[pd.Timestamp], confirmed_injury_dates: set[pd.Timestamp], team_game_dates: list,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Thin wrapper kept for this module's own readability — the grouping
+    logic itself lives in src/injury_backfill.py so the live per-request
+    path and the offline league-wide rebuild share one implementation
+    rather than two copies that can drift apart.
+    """
+    return build_intervals_from_missed_dates(missed_dates, confirmed_injury_dates, team_game_dates)
+
+
+def compute_live_injury_history_features(
+    player_id: int, player_name: str, as_of: pd.Timestamp, ref: LiveReferenceData,
+    player_game_log: pd.DataFrame, team_game_log: pd.DataFrame,
+    lookback_days: int = 365, max_gap_fill_checks: int = 8,
+) -> dict:
+    """Base counts come from compute_injury_history_features against the
+    frozen snapshot's intervals unchanged — that function already accepts
+    arbitrary game_rows with a GAME_DATE column, so it's "as of an
+    arbitrary date" by design, no adaptation needed there.
+
+    On top of that: best-effort gap-filling against the NBA's official
+    injury reports (src/injury_reports.py) for the player's own recently
+    missed games that fall AFTER the snapshot's coverage_end — see
+    _find_recent_missed_dates/_build_gap_fill_intervals for exactly what
+    "best-effort" means here (recency-biased, capped, conservative about
+    what counts as confirmed). This entire block is wrapped defensively:
+    any failure (network, a report layout change, anything) falls back to
+    the frozen-snapshot-only numbers untouched — this is a supplement, not
+    a dependency, and must never be able to break a live prediction.
+
+    Returns career_injury_count/days_missed_last_365d as before, plus
+    gap_fill_checked/gap_fill_confirmed (not FEATURE_COLUMNS — surfaced in
+    the API response's data_quality/caveats instead, see assemble_live_features).
+    """
+    intervals = ref.intervals
+    gap_fill_checked = gap_fill_confirmed = 0
+
+    try:
+        missed_dates = _find_recent_missed_dates(player_game_log, team_game_log, ref.coverage_end, as_of)
+        to_check = missed_dates[:max_gap_fill_checks]
+        confirmed_injury_dates = set()
+        for d in to_check:
+            # Per-date try/except, not one big one around the whole loop:
+            # confirmed live (this session) that the NBA's CDN can return a
+            # real HTTP error (403, not just a 404-for-no-report) on an
+            # otherwise-valid URL — without this, one bad date silently
+            # discarded every date already confirmed before it, which
+            # defeats the entire point of checking multiple dates.
+            try:
+                gap_fill_checked += 1
+                status_row = find_player_status_for_date(player_name, d)
+            except Exception:
+                continue
+            if (status_row is not None and status_row["STATUS"] == "Out"
+                    and categorize_report_reason(status_row["REASON"]) == "injury"):
+                confirmed_injury_dates.add(d)
+                gap_fill_confirmed += 1
+
+        if confirmed_injury_dates:
+            extra_starts, extra_ends = _build_gap_fill_intervals(
+                missed_dates, confirmed_injury_dates, team_game_log["GAME_DATE"].tolist(),
+            )
+            if len(extra_starts):
+                existing_starts, existing_ends = intervals.get(
+                    player_id, (np.array([], dtype="datetime64[ns]"), np.array([], dtype="datetime64[ns]"))
+                )
+                merged_starts = np.concatenate([existing_starts, extra_starts])
+                merged_ends = np.concatenate([existing_ends, extra_ends])
+                order = np.argsort(merged_starts)
+                intervals = dict(intervals)  # shallow copy — never mutate the shared snapshot
+                intervals[player_id] = (merged_starts[order], merged_ends[order])
+    except Exception:
+        intervals = ref.intervals
+        gap_fill_checked = gap_fill_confirmed = 0
+
     synthetic = pd.DataFrame({
         "PLAYER_ID": [player_id], "GAME_ID": ["9999999999"], "GAME_DATE": [as_of.normalize()],
     })
-    result = compute_injury_history_features(ref.intervals, synthetic, lookback_days=lookback_days)
+    result = compute_injury_history_features(intervals, synthetic, lookback_days=lookback_days)
     row = result.iloc[0]
     return {
         "career_injury_count": int(row["career_injury_count"]),
         "days_missed_last_365d": float(row[f"days_missed_last_{lookback_days}d"]),
+        "gap_fill_checked": gap_fill_checked,
+        "gap_fill_confirmed": gap_fill_confirmed,
+        # From the offline league-wide backfill (notebooks/22), not this
+        # live check: what fraction of this player's missed games in the
+        # supplemented window a report actually covered. None if no
+        # supplement has been built yet, or the player had no missed games
+        # in it (nothing to be uncertain about).
+        "injury_data_confidence": ref.confidence_for(player_id),
     }
 
 
@@ -613,7 +700,12 @@ def assemble_live_features(
     cohort_backfill_used = workload.pop("cohort_backfill_used")
 
     extended_absence = compute_live_extended_absence_features(player_game_log, as_of)
-    injury_history = compute_live_injury_history_features(player_id, as_of, ref)
+    injury_history = compute_live_injury_history_features(
+        player_id, bio_raw["full_name"], as_of, ref, player_game_log, team_game_log,
+    )
+    gap_fill_checked = injury_history.pop("gap_fill_checked")
+    gap_fill_confirmed = injury_history.pop("gap_fill_confirmed")
+    injury_data_confidence = injury_history.pop("injury_data_confidence")
 
     team_stats = team_stats_fetcher(team_id, as_of)
     if team_stats is None:
@@ -633,6 +725,21 @@ def assemble_live_features(
                           "message": "This player is returning from a gap of a full season or more."})
     if games_so_far == 0:
         warnings.append({"code": "NO_GAME_HISTORY", "message": "No prior games found in the pulled window."})
+    if gap_fill_confirmed > 0:
+        warnings.append({
+            "code": "RECENT_INJURY_DATA_SUPPLEMENTED",
+            "message": f"Checked {gap_fill_checked} recently missed game(s) against live NBA injury "
+                       f"reports; confirmed {gap_fill_confirmed} as injury absence(s) not yet reflected "
+                       f"in injury_history_as_of.",
+        })
+    if injury_data_confidence is not None and injury_data_confidence < LOW_CONFIDENCE_THRESHOLD:
+        warnings.append({
+            "code": "LOW_INJURY_DATA_CONFIDENCE",
+            "message": f"Only {injury_data_confidence:.0%} of this player's missed games since "
+                       f"{(ref.base_coverage_end or ref.coverage_end).date()} could be checked against an "
+                       f"official injury report, so their injury history — the model's strongest input — "
+                       f"is less certain than usual here.",
+        })
 
     data_quality = {
         "last_game_played": player_game_log["GAME_DATE"].max().date().isoformat() if len(player_game_log) else None,
@@ -640,6 +747,9 @@ def assemble_live_features(
         "games_used_for_workload": int(games_so_far),
         "cohort_backfill_used": cohort_backfill_used,
         "extended_absence_return": bool(extended_absence["is_returning_from_extended_absence"]),
+        "recent_injury_checks": gap_fill_checked,
+        "recent_injury_confirmed": gap_fill_confirmed,
+        "injury_data_confidence": injury_data_confidence,
     }
 
     return LiveFeatureResult(

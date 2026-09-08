@@ -1,4 +1,4 @@
-import type { ApiErrorDetail, PlayersResponse, RiskResponse } from "./types";
+import type { ApiErrorDetail, PlayersResponse, PlayerStatsResponse, RiskResponse } from "./types";
 
 // Server-only — never prefixed with NEXT_PUBLIC_, so this never reaches
 // client bundles. Real browser traffic goes through this app's own
@@ -46,4 +46,8 @@ export function fetchPlayers(): Promise<PlayersResponse> {
 
 export function fetchPlayerRisk(playerId: number): Promise<RiskResponse> {
   return backendFetch<RiskResponse>(`/players/${playerId}/risk`);
+}
+
+export function fetchPlayerStats(playerId: number): Promise<PlayerStatsResponse> {
+  return backendFetch<PlayerStatsResponse>(`/players/${playerId}/stats`);
 }
