@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     # aggregates barely move game to game, so a long TTL is fine.
     team_stats_cache_ttl_seconds: int = 21600  # 6h
 
+    # Route stats.nba.com calls through a relay instead of calling it
+    # directly — see backend/nba_relay.py for why. Unset (the local-dev
+    # default) means nba_api talks to stats.nba.com as normal.
+    nba_stats_relay_url: str | None = None
+    nba_stats_relay_token: str | None = None
+
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_allowed_origins.split(",") if origin.strip()]

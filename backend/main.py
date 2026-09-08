@@ -14,9 +14,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import settings
+from backend.nba_relay import apply_relay_patch
 from backend.schemas import HealthResponse
 from backend.state import build_app_state
 from backend.routers import players, risk, stats
+
+# Must run before anything below touches nba_api (build_app_state's first
+# live call, or the routers' request handlers) — see backend/nba_relay.py.
+apply_relay_patch()
 
 
 @asynccontextmanager

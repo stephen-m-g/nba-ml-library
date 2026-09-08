@@ -21,6 +21,7 @@ models/injury_risk/*
 kaggle.json
 .env
 backend/.env
+relay/.env
 
 # frontend/ has its own .gitignore (node_modules, .next/, .env*, etc.)
 
